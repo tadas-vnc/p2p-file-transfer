@@ -102,9 +102,9 @@
         import Peer from 'peerjs';
 
         // Debug switch - set to true to enable logging
-        const DEBUG = false;
-        const log = (...args) => DEBUG && console.log(...args);
-        const logError = (...args) => DEBUG && console.error(...args);
+        const DEBUG = true;
+        const log = (...args) => console.log('[DEBUG]', ...args);
+        const logError = (...args) => console.error('[DEBUG ERROR]', ...args);
 
         // Utility functions
         const generateUserId = () => {
@@ -149,6 +149,7 @@
                 });
 
                 newPeer.on('connection', (conn) => {
+                    log('[PEER] Incoming connection event from:', conn.peer);
                     handleIncomingConnection(conn, newPeer);
                 });
 
@@ -165,12 +166,12 @@
             }, [userId]);
 
             const handleIncomingConnection = (conn, peerInstance) => {
-                log('[CONN] Incoming connection from:', conn.peer);
-                conn.on('open', () => {
-                    log('[CONN] Connection opened with:', conn.peer);
-                    conn.on('data', (data) => {
-                        log('[DATA] Received:', data.type, data);
-                        if (data.type === 'file-request') {
+                log('[CONN] handleIncomingConnection called, peer:', conn.peer, 'isInitiator:', conn._negotiator?._negotiating);
+                
+                // Set up data handler IMMEDIATELY, not inside 'open' callback
+                conn.on('data', (data) => {
+                    log('[DATA] Received data:', data.type, 'from:', conn.peer, 'full data:', data);
+                    if (data.type === 'file-request') {
                             // Add to incoming requests
                             setIncomingRequests(prev => [...prev, {
                                 id: Date.now(),
@@ -197,7 +198,10 @@
                             setStatus('Transfer rejected by recipient');
                             setActiveTransfers(prev => prev.filter(t => t.targetId !== conn.peer));
                         }
-                    });
+                });
+                
+                conn.on('open', () => {
+                    log('[CONN] Connection OPENED with:', conn.peer);
                 });
 
                 conn.on('close', () => {
@@ -326,18 +330,34 @@
 
             const sendFileRequest = () => {
                 if (!selectedFile || !sendTarget) return;
+                log('[SEND] sendFileRequest called, target:', sendTarget, 'file:', selectedFile.name);
 
                 // Find or create connection
                 let conn = connections.get(sendTarget);
+                log('[SEND] Existing connection?', !!conn, 'connection state:', conn?.open);
+                
                 if (!conn) {
+                    log('[SEND] Creating new connection to:', sendTarget);
                     conn = peer.connect(sendTarget, { reliable: true });
+                    handleIncomingConnection(conn, peer);
                     conn.on('open', () => {
+                        log('[SEND] Connection opened, sending request now');
                         sendRequest(conn);
                         setConnections(prev => new Map(prev).set(sendTarget, conn));
                     });
-                    handleIncomingConnection(conn, peer);
+                    conn.on('error', (err) => {
+                        logError('[SEND] Connection error:', err);
+                    });
                 } else {
-                    sendRequest(conn);
+                    log('[SEND] Using existing connection, open:', conn.open);
+                    if (conn.open) {
+                        sendRequest(conn);
+                    } else {
+                        conn.on('open', () => {
+                            log('[SEND] Existing connection now open, sending request');
+                            sendRequest(conn);
+                        });
+                    }
                 }
             };
 
@@ -345,18 +365,22 @@
                 const transferId = Date.now().toString();
                 log('[REQUEST] Creating transfer request, ID:', transferId);
                 log('[REQUEST] File:', selectedFile.name, selectedFile.size, selectedFile.type);
+                log('[REQUEST] Connection state, open:', conn.open, 'peer:', conn.peer);
                 
                 // Store file for later transfer
                 pendingTransfersRef.current.set(transferId, selectedFile);
                 log('[REQUEST] Stored in pendingTransfers, keys:', Array.from(pendingTransfersRef.current.keys()));
                 
-                conn.send({
+                const message = {
                     type: 'file-request',
                     transferId,
                     fileName: selectedFile.name,
                     fileSize: selectedFile.size,
                     fileType: selectedFile.type,
-                });
+                };
+                log('[REQUEST] Sending message:', message);
+                conn.send(message);
+                log('[REQUEST] Message sent!');
                 setStatus(`Request sent to ${sendTarget}`);
             };
 
