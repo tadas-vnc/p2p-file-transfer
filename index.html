@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P File Transfer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        mono: ['JetBrains Mono', 'monospace'],
+                        display: ['Space Grotesk', 'sans-serif'],
+                    },
+                    colors: {
+                        cyber: {
+                            50: '#ecfeff',
+                            100: '#cffafe',
+                            200: '#a5f3fc',
+                            300: '#67e8f9',
+                            400: '#22d3ee',
+                            500: '#06b6d4',
+                            600: '#0891b2',
+                            700: '#0e7490',
+                            800: '#155e75',
+                            900: '#164e63',
+                        },
+                        void: {
+                            50: '#f8fafc',
+                            100: '#f1f5f9',
+                            200: '#e2e8f0',
+                            300: '#cbd5e1',
+                            400: '#94a3b8',
+                            500: '#64748b',
+                            600: '#475569',
+                            700: '#334155',
+                            800: '#1e293b',
+                            900: '#0f172a',
+                            950: '#020617',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @keyframes pulse-glow {
+            0%, 100% { box-shadow: 0 0 20px rgba(6, 182, 212, 0.3); }
+            50% { box-shadow: 0 0 40px rgba(6, 182, 212, 0.6); }
+        }
+        @keyframes scan-line {
+            0% { transform: translateY(-100%); }
+            100% { transform: translateY(100%); }
+        }
+        @keyframes data-flow {
+            0% { background-position: 0% 50%; }
+            100% { background-position: 100% 50%; }
+        }
+        .pulse-glow { animation: pulse-glow 2s ease-in-out infinite; }
+        .scan-effect::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, rgba(6, 182, 212, 0.8), transparent);
+            animation: scan-line 3s linear infinite;
+        }
+        .data-gradient {
+            background: linear-gradient(90deg, #06b6d4, #0891b2, #06b6d4);
+            background-size: 200% 100%;
+            animation: data-flow 2s linear infinite;
+        }
+        .grid-bg {
+            background-image: 
+                linear-gradient(rgba(6, 182, 212, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(6, 182, 212, 0.03) 1px, transparent 1px);
+            background-size: 40px 40px;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "preact": "https://esm.sh/preact@10.23.1",
+                "preact/": "https://esm.sh/preact@10.23.1/",
+                "htm/preact": "https://esm.sh/htm@3.1.1/preact?external=preact",
+                "peerjs": "https://esm.sh/peerjs@1.5.2"
+            }
+        }
+    </script>
+</head>
+<body class="bg-void-950 text-void-100 font-display min-h-screen grid-bg">
+    <div id="app"></div>
+
+    <script type="module">
+        import { render } from 'preact';
+        import { useState, useEffect, useRef } from 'preact/hooks';
+        import { html } from 'htm/preact';
+        import Peer from 'peerjs';
+
+        // Debug switch - set to true to enable logging
+        const DEBUG = false;
+        const log = (...args) => DEBUG && console.log(...args);
+        const logError = (...args) => DEBUG && console.error(...args);
+
+        // Utility functions
+        const generateUserId = () => {
+            const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+            return Array.from({ length: 8 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+        };
+
+        const formatBytes = (bytes) => {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        };
+
+        // Main App Component
+        function App() {
+            const [userId, setUserId] = useState(() => localStorage.getItem('p2p-user-id') || '');
+            const [isConnected, setIsConnected] = useState(false);
+            const [peer, setPeer] = useState(null);
+            const [connections, setConnections] = useState(new Map());
+            const [incomingRequests, setIncomingRequests] = useState([]);
+            const [activeTransfers, setActiveTransfers] = useState([]);
+            const [sendTarget, setSendTarget] = useState('');
+            const [selectedFile, setSelectedFile] = useState(null);
+            const [status, setStatus] = useState('');
+            const pendingTransfersRef = useRef(new Map()); // transferId -> file
+            const fileInputRef = useRef(null);
+
+            // Initialize PeerJS
+            useEffect(() => {
+                if (!userId) return;
+
+                const newPeer = new Peer(userId, {
+                    debug: 1,
+                });
+
+                newPeer.on('open', (id) => {
+                    setIsConnected(true);
+                    setStatus('Connected to relay server');
+                    localStorage.setItem('p2p-user-id', id);
+                });
+
+                newPeer.on('connection', (conn) => {
+                    handleIncomingConnection(conn, newPeer);
+                });
+
+                newPeer.on('error', (err) => {
+                    logError('Peer error:', err);
+                    setStatus(`Error: ${err.type}`);
+                });
+
+                setPeer(newPeer);
+
+                return () => {
+                    newPeer.destroy();
+                };
+            }, [userId]);
+
+            const handleIncomingConnection = (conn, peerInstance) => {
+                log('[CONN] Incoming connection from:', conn.peer);
+                conn.on('open', () => {
+                    log('[CONN] Connection opened with:', conn.peer);
+                    conn.on('data', (data) => {
+                        log('[DATA] Received:', data.type, data);
+                        if (data.type === 'file-request') {
+                            // Add to incoming requests
+                            setIncomingRequests(prev => [...prev, {
+                                id: Date.now(),
+                                transferId: data.transferId,
+                                from: conn.peer,
+                                fileName: data.fileName,
+                                fileSize: data.fileSize,
+                                fileType: data.fileType,
+                                conn: conn,
+                            }]);
+                        } else if (data.type === 'file-chunk') {
+                            // Handle incoming file chunk
+                            log('[CHUNK] Index:', data.chunkIndex, '/', data.totalChunks, 'Size:', data.chunk?.byteLength);
+                            handleFileChunk(data, conn);
+                        } else if (data.type === 'file-complete') {
+                            // Signal file transfer complete
+                            handleFileComplete(data, conn);
+                        } else if (data.type === 'transfer-accepted') {
+                            // Start sending file
+                            log('[ACCEPT] Transfer accepted, ID:', data.transferId);
+                            log('[ACCEPT] Pending transfers:', Array.from(pendingTransfersRef.current.keys()));
+                            startFileTransfer(conn, data.transferId);
+                        } else if (data.type === 'transfer-rejected') {
+                            setStatus('Transfer rejected by recipient');
+                            setActiveTransfers(prev => prev.filter(t => t.targetId !== conn.peer));
+                        }
+                    });
+                });
+
+                conn.on('close', () => {
+                    setConnections(prev => {
+                        const newConns = new Map(prev);
+                        newConns.delete(conn.peer);
+                        return newConns;
+                    });
+                });
+
+                setConnections(prev => new Map(prev).set(conn.peer, conn));
+            };
+
+            const handleFileChunk = (data, conn) => {
+                const { transferId, chunk, chunkIndex, totalChunks } = data;
+                log('[HANDLE CHUNK] transferId:', transferId, 'chunk:', chunkIndex, '/', totalChunks);
+                
+                setActiveTransfers(prev => {
+                    log('[HANDLE CHUNK] Current transfers:', prev.map(t => ({ id: t.id, progress: t.progress })));
+                    return prev.map(transfer => {
+                    if (transfer.id === transferId) {
+                        const newChunks = [...(transfer.chunks || []), { index: chunkIndex, data: chunk }];
+                        const progress = ((chunkIndex + 1) / totalChunks) * 100;
+                        log('[HANDLE CHUNK] Updated progress:', progress);
+                        return { ...transfer, chunks: newChunks, progress, receivedBytes: transfer.receivedBytes + chunk.byteLength };
+                    }
+                    log('[HANDLE CHUNK] No match for transferId:', transferId);
+                    return transfer;
+                });});
+            };
+
+            const handleFileComplete = (data, conn) => {
+                const { transferId } = data;
+                
+                setActiveTransfers(prev => {
+                    const transfer = prev.find(t => t.id === transferId);
+                    if (transfer && transfer.chunks) {
+                        // Reconstruct file
+                        const blob = new Blob(transfer.chunks.sort((a, b) => a.index - b.index).map(c => c.data), { type: transfer.fileType });
+                        const url = URL.createObjectURL(blob);
+                        
+                        // Trigger download
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = transfer.fileName;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                    }
+                    return prev.filter(t => t.id !== transferId);
+                });
+
+                setStatus('File received and saved!');
+            };
+
+            const startFileTransfer = (conn, transferId) => {
+                log('[START] Starting transfer:', transferId);
+                log('[START] Pending transfers map:', Array.from(pendingTransfersRef.current.entries()));
+                const file = pendingTransfersRef.current.get(transferId);
+                log('[START] File found:', file ? file.name : 'NOT FOUND');
+                if (!file) {
+                    logError('[START] No pending file for transfer:', transferId);
+                    return;
+                }
+
+                const CHUNK_SIZE = 16384; // 16KB chunks
+                const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+                setActiveTransfers(prev => [...prev, {
+                    id: transferId,
+                    fileName: file.name,
+                    fileSize: file.size,
+                    fileType: file.type,
+                    progress: 0,
+                    direction: 'sending',
+                    targetId: conn.peer,
+                }]);
+
+                const reader = new FileReader();
+                let chunkIndex = 0;
+
+                const sendNextChunk = () => {
+                    const start = chunkIndex * CHUNK_SIZE;
+                    const end = Math.min(start + CHUNK_SIZE, file.size);
+                    const chunk = file.slice(start, end);
+
+                    reader.onload = (e) => {
+                        conn.send({
+                            type: 'file-chunk',
+                            transferId,
+                            chunk: e.target.result,
+                            chunkIndex,
+                            totalChunks,
+                        });
+
+                        chunkIndex++;
+                        const progress = (chunkIndex / totalChunks) * 100;
+                        
+                        setActiveTransfers(prev => prev.map(t => 
+                            t.id === transferId ? { ...t, progress } : t
+                        ));
+
+                        if (chunkIndex < totalChunks) {
+                            sendNextChunk();
+                        } else {
+                            log('[SEND] Transfer complete:', transferId);
+                            conn.send({ type: 'file-complete', transferId });
+                            setStatus('File sent successfully!');
+                            pendingTransfersRef.current.delete(transferId);
+                            setSelectedFile(null);
+                            if (fileInputRef.current) fileInputRef.current.value = '';
+                        }
+                    };
+
+                    reader.readAsArrayBuffer(chunk);
+                };
+
+                sendNextChunk();
+            };
+
+            const connectToPeer = (targetId) => {
+                if (!peer || !targetId || targetId === userId) return;
+
+                const conn = peer.connect(targetId, { reliable: true });
+                handleIncomingConnection(conn, peer);
+            };
+
+            const sendFileRequest = () => {
+                if (!selectedFile || !sendTarget) return;
+
+                // Find or create connection
+                let conn = connections.get(sendTarget);
+                if (!conn) {
+                    conn = peer.connect(sendTarget, { reliable: true });
+                    conn.on('open', () => {
+                        sendRequest(conn);
+                        setConnections(prev => new Map(prev).set(sendTarget, conn));
+                    });
+                    handleIncomingConnection(conn, peer);
+                } else {
+                    sendRequest(conn);
+                }
+            };
+
+            const sendRequest = (conn) => {
+                const transferId = Date.now().toString();
+                log('[REQUEST] Creating transfer request, ID:', transferId);
+                log('[REQUEST] File:', selectedFile.name, selectedFile.size, selectedFile.type);
+                
+                // Store file for later transfer
+                pendingTransfersRef.current.set(transferId, selectedFile);
+                log('[REQUEST] Stored in pendingTransfers, keys:', Array.from(pendingTransfersRef.current.keys()));
+                
+                conn.send({
+                    type: 'file-request',
+                    transferId,
+                    fileName: selectedFile.name,
+                    fileSize: selectedFile.size,
+                    fileType: selectedFile.type,
+                });
+                setStatus(`Request sent to ${sendTarget}`);
+            };
+
+            const acceptTransfer = (request) => {
+                const transferId = request.transferId;
+                log('[ACCEPT] Accepting transfer:', transferId, 'from:', request.from);
+                log('[ACCEPT] File:', request.fileName, request.fileSize);
+                
+                setActiveTransfers(prev => [...prev, {
+                    id: transferId,
+                    fileName: request.fileName,
+                    fileSize: request.fileSize,
+                    fileType: request.fileType,
+                    progress: 0,
+                    direction: 'receiving',
+                    fromId: request.from,
+                    chunks: [],
+                    receivedBytes: 0,
+                }]);
+
+                request.conn.send({ type: 'transfer-accepted', transferId });
+                setIncomingRequests(prev => prev.filter(r => r.id !== request.id));
+                setStatus('Receiving file...');
+            };
+
+            const rejectTransfer = (request) => {
+                request.conn.send({ type: 'transfer-rejected' });
+                setIncomingRequests(prev => prev.filter(r => r.id !== request.id));
+                setStatus('Transfer rejected');
+            };
+
+            // User ID Setup Screen
+            if (!userId) {
+                return html`
+                    <div class="min-h-screen flex items-center justify-center p-4">
+                        <div class="w-full max-w-md">
+                            <div class="text-center mb-8">
+                                <div class="inline-flex items-center justify-center w-20 h-20 rounded-2xl bg-void-900 border border-void-800 mb-6 pulse-glow">
+                                    <svg class="w-10 h-10 text-cyber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h7a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                                    </svg>
+                                </div>
+                                <h1 class="text-3xl font-bold text-void-50 mb-2">P2P Transfer</h1>
+                                <p class="text-void-400 font-mono text-sm">Direct peer-to-peer file sharing</p>
+                            </div>
+                            
+                            <div class="bg-void-900/50 backdrop-blur border border-void-800 rounded-2xl p-6 relative overflow-hidden scan-effect">
+                                <h2 class="text-lg font-semibold text-void-200 mb-4">Choose Your ID</h2>
+                                <div class="space-y-4">
+                                    <div>
+                                        <label class="block text-sm text-void-400 mb-2 font-mono">User ID</label>
+                                        <input
+                                            type="text"
+                                            id="userIdInput"
+                                            placeholder="Enter or generate ID"
+                                            class="w-full bg-void-950 border border-void-700 rounded-lg px-4 py-3 text-void-100 font-mono placeholder-void-600 focus:outline-none focus:border-cyber-500 focus:ring-1 focus:ring-cyber-500 transition-all"
+                                            maxlength="12"
+                                        />
+                                    </div>
+                                    <button
+                                        onClick=${() => {
+                                            const input = document.getElementById('userIdInput');
+                                            input.value = generateUserId();
+                                        }}
+                                        class="w-full bg-void-800 hover:bg-void-700 text-void-300 font-mono text-sm py-3 rounded-lg transition-all border border-void-700"
+                                    >
+                                        Generate Random ID
+                                    </button>
+                                    <button
+                                        onClick=${() => {
+                                            const input = document.getElementById('userIdInput');
+                                            const id = input.value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+                                            if (id.length >= 4) setUserId(id);
+                                        }}
+                                        class="w-full bg-cyber-600 hover:bg-cyber-500 text-white font-semibold py-3 rounded-lg transition-all"
+                                    >
+                                        Connect
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Main App
+            return html`
+                <div class="min-h-screen p-4 md:p-8">
+                    <div class="max-w-4xl mx-auto">
+                        <!-- Header -->
+                        <header class="flex items-center justify-between mb-8">
+                            <div class="flex items-center gap-4">
+                                <div class="w-12 h-12 rounded-xl bg-void-900 border border-void-800 flex items-center justify-center ${isConnected ? 'pulse-glow' : ''}">
+                                    <svg class="w-6 h-6 text-cyber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h7a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <h1 class="text-xl font-bold text-void-50">P2P Transfer</h1>
+                                    <div class="flex items-center gap-2">
+                                        <span class="w-2 h-2 rounded-full ${isConnected ? 'bg-cyber-400' : 'bg-void-600'}"></span>
+                                        <span class="text-sm font-mono text-void-400">${userId}</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <button
+                                onClick=${() => { localStorage.removeItem('p2p-user-id'); setUserId(''); }}
+                                class="text-void-500 hover:text-void-300 text-sm font-mono transition-colors"
+                            >
+                                Change ID
+                            </button>
+                        </header>
+
+                        ${status && html`
+                            <div class="mb-6 bg-void-900/50 border border-void-800 rounded-lg px-4 py-3 font-mono text-sm text-cyber-400">
+                                ${status}
+                            </div>
+                        `}
+
+                        <!-- Incoming Requests -->
+                        ${incomingRequests.length > 0 && html`
+                            <section class="mb-8">
+                                <h2 class="text-lg font-semibold text-void-200 mb-4 flex items-center gap-2">
+                                    <span class="w-2 h-2 rounded-full bg-cyber-400 animate-pulse"></span>
+                                    Incoming Requests
+                                </h2>
+                                <div class="space-y-3">
+                                    ${incomingRequests.map(request => html`
+                                        <div key=${request.id} class="bg-void-900/50 backdrop-blur border border-cyber-500/30 rounded-xl p-4 relative overflow-hidden scan-effect">
+                                            <div class="flex items-center justify-between">
+                                                <div>
+                                                    <div class="font-mono text-cyber-400 text-sm mb-1">From: ${request.from}</div>
+                                                    <div class="font-semibold text-void-100">${request.fileName}</div>
+                                                    <div class="text-void-400 text-sm font-mono">${formatBytes(request.fileSize)}</div>
+                                                </div>
+                                                <div class="flex gap-2">
+                                                    <button
+                                                        onClick=${() => acceptTransfer(request)}
+                                                        class="bg-cyber-600 hover:bg-cyber-500 text-white px-4 py-2 rounded-lg font-semibold text-sm transition-all"
+                                                    >
+                                                        Accept
+                                                    </button>
+                                                    <button
+                                                        onClick=${() => rejectTransfer(request)}
+                                                        class="bg-void-700 hover:bg-void-600 text-void-300 px-4 py-2 rounded-lg font-semibold text-sm transition-all"
+                                                    >
+                                                        Reject
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    `)}
+                                </div>
+                            </section>
+                        `}
+
+                        <!-- Active Transfers -->
+                        ${activeTransfers.length > 0 && html`
+                            <section class="mb-8">
+                                <h2 class="text-lg font-semibold text-void-200 mb-4">Active Transfers</h2>
+                                <div class="space-y-3">
+                                    ${activeTransfers.map(transfer => html`
+                                        <div key=${transfer.id} class="bg-void-900/50 backdrop-blur border border-void-800 rounded-xl p-4">
+                                            <div class="flex items-center justify-between mb-3">
+                                                <div>
+                                                    <div class="font-semibold text-void-100">${transfer.fileName}</div>
+                                                    <div class="text-void-400 text-sm font-mono">
+                                                        ${transfer.direction === 'sending' ? 'Sending to ' + transfer.targetId : 'Receiving from ' + transfer.fromId}
+                                                    </div>
+                                                </div>
+                                                <div class="text-right">
+                                                    <div class="font-mono text-cyber-400">${Math.round(transfer.progress)}%</div>
+                                                    <div class="text-void-500 text-sm font-mono">
+                                                        ${transfer.receivedBytes ? formatBytes(transfer.receivedBytes) : formatBytes(transfer.fileSize * transfer.progress / 100)} / ${formatBytes(transfer.fileSize)}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <div class="h-2 bg-void-800 rounded-full overflow-hidden">
+                                                <div 
+                                                    class="h-full data-gradient rounded-full transition-all duration-300"
+                                                    style="width: ${transfer.progress}%"
+                                                ></div>
+                                            </div>
+                                        </div>
+                                    `)}
+                                </div>
+                            </section>
+                        `}
+
+                        <!-- Main Grid -->
+                        <div class="grid md:grid-cols-2 gap-6">
+                            <!-- Send Section -->
+                            <section class="bg-void-900/50 backdrop-blur border border-void-800 rounded-2xl p-6 relative overflow-hidden">
+                                <div class="flex items-center gap-3 mb-6">
+                                    <div class="w-10 h-10 rounded-lg bg-cyber-600/20 flex items-center justify-center">
+                                        <svg class="w-5 h-5 text-cyber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4"/>
+                                        </svg>
+                                    </div>
+                                    <h2 class="text-lg font-semibold text-void-200">Send File</h2>
+                                </div>
+                                
+                                <div class="space-y-4">
+                                    <div>
+                                        <label class="block text-sm text-void-400 mb-2 font-mono">Target User ID</label>
+                                        <input
+                                            type="text"
+                                            value=${sendTarget}
+                                            onInput=${(e) => setSendTarget(e.target.value.toLowerCase().replace(/[^a-z0-9]/g, ''))}
+                                            placeholder="recipient-id"
+                                            class="w-full bg-void-950 border border-void-700 rounded-lg px-4 py-3 text-void-100 font-mono placeholder-void-600 focus:outline-none focus:border-cyber-500 focus:ring-1 focus:ring-cyber-500 transition-all"
+                                        />
+                                    </div>
+                                    
+                                    <div>
+                                        <label class="block text-sm text-void-400 mb-2 font-mono">Select File</label>
+                                        <div class="relative">
+                                            <input
+                                                ref=${fileInputRef}
+                                                type="file"
+                                                onChange=${(e) => setSelectedFile(e.target.files[0])}
+                                                class="hidden"
+                                                id="fileInput"
+                                            />
+                                            <label
+                                                for="fileInput"
+                                                class="block w-full bg-void-950 border border-dashed border-void-700 rounded-lg px-4 py-6 text-center cursor-pointer hover:border-cyber-500 transition-all"
+                                            >
+                                                ${selectedFile ? html`
+                                                    <div class="text-void-100 font-semibold">${selectedFile.name}</div>
+                                                    <div class="text-void-400 text-sm font-mono">${formatBytes(selectedFile.size)}</div>
+                                                ` : html`
+                                                    <div class="text-void-400">Click to select file</div>
+                                                `}
+                                            </label>
+                                        </div>
+                                    </div>
+                                    
+                                    <button
+                                        onClick=${sendFileRequest}
+                                        disabled=${!selectedFile || !sendTarget}
+                                        class="w-full bg-cyber-600 hover:bg-cyber-500 disabled:bg-void-800 disabled:text-void-500 text-white font-semibold py-3 rounded-lg transition-all disabled:cursor-not-allowed"
+                                    >
+                                        Send Request
+                                    </button>
+                                </div>
+                            </section>
+
+                            <!-- Receive Section -->
+                            <section class="bg-void-900/50 backdrop-blur border border-void-800 rounded-2xl p-6 relative overflow-hidden">
+                                <div class="flex items-center gap-3 mb-6">
+                                    <div class="w-10 h-10 rounded-lg bg-cyber-600/20 flex items-center justify-center">
+                                        <svg class="w-5 h-5 text-cyber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+                                        </svg>
+                                    </div>
+                                    <h2 class="text-lg font-semibold text-void-200">Receive Files</h2>
+                                </div>
+                                
+                                <div class="text-center py-8">
+                                    <div class="w-16 h-16 rounded-xl bg-void-800 border border-void-700 flex items-center justify-center mx-auto mb-4">
+                                        <svg class="w-8 h-8 text-void-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                                        </svg>
+                                    </div>
+                                    <p class="text-void-400 mb-2">Waiting for incoming files</p>
+                                    <p class="text-void-500 text-sm font-mono">Your ID: <span class="text-cyber-400">${userId}</span></p>
+                                    <p class="text-void-600 text-xs mt-4">Share your ID with others to receive files</p>
+                                </div>
+                                
+                                ${incomingRequests.length > 0 && html`
+                                    <div class="mt-4 pt-4 border-t border-void-800">
+                                        <p class="text-sm text-void-400">
+                                            <span class="text-cyber-400 font-semibold">${incomingRequests.length}</span> pending request${incomingRequests.length > 1 ? 's' : ''}
+                                        </p>
+                                    </div>
+                                `}
+                            </section>
+                        </div>
+
+                        <!-- Connection Status -->
+                        <footer class="mt-8 text-center">
+                            <div class="inline-flex items-center gap-2 bg-void-900/30 border border-void-800 rounded-full px-4 py-2">
+                                <span class="w-2 h-2 rounded-full ${isConnected ? 'bg-cyber-400' : 'bg-void-600'}"></span>
+                                <span class="text-sm font-mono text-void-400">
+                                    ${isConnected ? 'Connected via PeerJS relay' : 'Connecting...'}
+                                </span>
+                            </div>
+                        </footer>
+                    </div>
+                </div>
+            `;
+        }
+
+        render(html`<${App} />`, document.getElementById('app'));
+    </script>
+</body>
+</html>
