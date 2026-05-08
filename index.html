@@ -87,7 +87,8 @@
                 "preact": "https://esm.sh/preact@10.23.1",
                 "preact/": "https://esm.sh/preact@10.23.1/",
                 "htm/preact": "https://esm.sh/htm@3.1.1/preact?external=preact",
-                "peerjs": "https://esm.sh/peerjs@1.5.2"
+                "peerjs": "https://esm.sh/peerjs@1.5.2",
+                "jszip": "https://esm.sh/jszip@3.10.1"
             }
         }
     </script>
@@ -100,6 +101,7 @@
         import { useState, useEffect, useRef } from 'preact/hooks';
         import { html } from 'htm/preact';
         import Peer from 'peerjs';
+        import JSZip from 'jszip';
 
         // Debug switch - set to true to enable logging
         const DEBUG = true;
@@ -129,7 +131,8 @@
             const [incomingRequests, setIncomingRequests] = useState([]);
             const [activeTransfers, setActiveTransfers] = useState([]);
             const [sendTarget, setSendTarget] = useState('');
-            const [selectedFile, setSelectedFile] = useState(null);
+            const [selectedFiles, setSelectedFiles] = useState([]);
+            const [isZipping, setIsZipping] = useState(false);
             const [status, setStatus] = useState('');
             const pendingTransfersRef = useRef(new Map()); // transferId -> file
             const fileInputRef = useRef(null);
@@ -310,7 +313,7 @@
                             conn.send({ type: 'file-complete', transferId });
                             setStatus('File sent successfully!');
                             pendingTransfersRef.current.delete(transferId);
-                            setSelectedFile(null);
+                            setSelectedFiles([]);
                             if (fileInputRef.current) fileInputRef.current.value = '';
                         }
                     };
@@ -328,9 +331,35 @@
                 handleIncomingConnection(conn, peer);
             };
 
-            const sendFileRequest = () => {
-                if (!selectedFile || !sendTarget) return;
-                log('[SEND] sendFileRequest called, target:', sendTarget, 'file:', selectedFile.name);
+            const sendFileRequest = async () => {
+                if (selectedFiles.length === 0 || !sendTarget) return;
+                
+                let fileToSend;
+                if (selectedFiles.length === 1) {
+                    fileToSend = selectedFiles[0];
+                } else {
+                    // Multiple files - create zip
+                    setIsZipping(true);
+                    setStatus('Creating zip archive...');
+                    try {
+                        const zip = new JSZip();
+                        for (const file of selectedFiles) {
+                            const content = await file.arrayBuffer();
+                            zip.file(file.name, content);
+                        }
+                        const zipBlob = await zip.generateAsync({ type: 'blob' });
+                        fileToSend = new File([zipBlob], 'files.zip', { type: 'application/zip' });
+                        setStatus('Zip created, sending...');
+                    } catch (err) {
+                        logError('[ZIP] Error creating zip:', err);
+                        setStatus('Error creating zip archive');
+                        setIsZipping(false);
+                        return;
+                    }
+                    setIsZipping(false);
+                }
+                
+                log('[SEND] sendFileRequest called, target:', sendTarget, 'file:', fileToSend.name);
 
                 // Find or create connection
                 let conn = connections.get(sendTarget);
@@ -342,7 +371,7 @@
                     handleIncomingConnection(conn, peer);
                     conn.on('open', () => {
                         log('[SEND] Connection opened, sending request now');
-                        sendRequest(conn);
+                        sendRequest(conn, fileToSend);
                         setConnections(prev => new Map(prev).set(sendTarget, conn));
                     });
                     conn.on('error', (err) => {
@@ -351,32 +380,32 @@
                 } else {
                     log('[SEND] Using existing connection, open:', conn.open);
                     if (conn.open) {
-                        sendRequest(conn);
+                        sendRequest(conn, fileToSend);
                     } else {
                         conn.on('open', () => {
                             log('[SEND] Existing connection now open, sending request');
-                            sendRequest(conn);
+                            sendRequest(conn, fileToSend);
                         });
                     }
                 }
             };
 
-            const sendRequest = (conn) => {
+            const sendRequest = (conn, file) => {
                 const transferId = Date.now().toString();
                 log('[REQUEST] Creating transfer request, ID:', transferId);
-                log('[REQUEST] File:', selectedFile.name, selectedFile.size, selectedFile.type);
+                log('[REQUEST] File:', file.name, file.size, file.type);
                 log('[REQUEST] Connection state, open:', conn.open, 'peer:', conn.peer);
                 
                 // Store file for later transfer
-                pendingTransfersRef.current.set(transferId, selectedFile);
+                pendingTransfersRef.current.set(transferId, file);
                 log('[REQUEST] Stored in pendingTransfers, keys:', Array.from(pendingTransfersRef.current.keys()));
                 
                 const message = {
                     type: 'file-request',
                     transferId,
-                    fileName: selectedFile.name,
-                    fileSize: selectedFile.size,
-                    fileType: selectedFile.type,
+                    fileName: file.name,
+                    fileSize: file.size,
+                    fileType: file.type,
                 };
                 log('[REQUEST] Sending message:', message);
                 conn.send(message);
@@ -601,7 +630,8 @@
                                             <input
                                                 ref=${fileInputRef}
                                                 type="file"
-                                                onChange=${(e) => setSelectedFile(e.target.files[0])}
+                                                multiple
+                                                onChange=${(e) => setSelectedFiles(Array.from(e.target.files))}
                                                 class="hidden"
                                                 id="fileInput"
                                             />
@@ -609,11 +639,24 @@
                                                 for="fileInput"
                                                 class="block w-full bg-void-950 border border-dashed border-void-700 rounded-lg px-4 py-6 text-center cursor-pointer hover:border-cyber-500 transition-all"
                                             >
-                                                ${selectedFile ? html`
-                                                    <div class="text-void-100 font-semibold">${selectedFile.name}</div>
-                                                    <div class="text-void-400 text-sm font-mono">${formatBytes(selectedFile.size)}</div>
+                                                ${selectedFiles.length > 0 ? html`
+                                                    <div class="text-void-100 font-semibold">
+                                                        ${selectedFiles.length === 1 
+                                                            ? selectedFiles[0].name 
+                                                            : `${selectedFiles.length} files (will be zipped)`}
+                                                    </div>
+                                                    <div class="text-void-400 text-sm font-mono">
+                                                        ${selectedFiles.length === 1 
+                                                            ? formatBytes(selectedFiles[0].size)
+                                                            : formatBytes(selectedFiles.reduce((sum, f) => sum + f.size, 0))}
+                                                    </div>
+                                                    ${selectedFiles.length > 1 && html`
+                                                        <div class="mt-2 text-xs text-void-500 max-h-20 overflow-y-auto">
+                                                            ${selectedFiles.map(f => html`<div>${f.name}</div>`)}
+                                                        </div>
+                                                    `}
                                                 ` : html`
-                                                    <div class="text-void-400">Click to select file</div>
+                                                    <div class="text-void-400">Click to select file(s)</div>
                                                 `}
                                             </label>
                                         </div>
@@ -621,10 +664,10 @@
                                     
                                     <button
                                         onClick=${sendFileRequest}
-                                        disabled=${!selectedFile || !sendTarget}
+                                        disabled=${selectedFiles.length === 0 || !sendTarget || isZipping}
                                         class="w-full bg-cyber-600 hover:bg-cyber-500 disabled:bg-void-800 disabled:text-void-500 text-white font-semibold py-3 rounded-lg transition-all disabled:cursor-not-allowed"
                                     >
-                                        Send Request
+                                        ${isZipping ? 'Creating Zip...' : 'Send Request'}
                                     </button>
                                 </div>
                             </section>
